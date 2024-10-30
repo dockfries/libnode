@@ -35,7 +35,7 @@ jobs:
             ./scripts/build-macos.sh
           fi
       - name: Upload artifacts
-        uses: actions/upload-artifact@v2.3.1
+        uses: actions/upload-artifact@v4
         with:
           name: libnode-${{ env.NODE_VERSION }}-${{ runner.os }}-${{ matrix.arch }}
           path: ./artifacts
