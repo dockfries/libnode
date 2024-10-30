@@ -9,3 +9,5 @@ cd ./node
 
 mv ./out/Release/node-${NODE_VERSION}-win-x86 "${OUTPUT_PREFIX}/"
 cp ./LICENSE "${OUTPUT_PREFIX}/LICENSE"
+
+#
