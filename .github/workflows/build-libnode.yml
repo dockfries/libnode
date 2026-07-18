@@ -1,0 +1,316 @@
+# =============================================================================
+# Build libnode — GitHub Actions Workflow
+# =============================================================================
+#
+# Two ways to trigger a build:
+#
+#   1. Push a version tag (recommended for releases):
+#        v22.0.0
+#
+#   2. Manual workflow_dispatch (ad-hoc / testing):
+#        Enter version in the GitHub UI
+#
+# Only even major versions >= 22 are accepted.
+#
+# Build matrix:
+#   v22: Linux x64 + Linux x86 (Docker) + Windows x64 + Windows x86
+#   v24+: Linux x64 + Windows x64
+#
+# Outputs (uploaded to GitHub Release):
+#   libnode-linux-x64.tar.gz
+#   libnode-linux-x86.tar.gz   (v22 only)
+#   libnode-windows-x64.zip
+#   libnode-windows-x86.zip    (v22 only)
+#
+# =============================================================================
+
+name: Build libnode
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Node.js version to build (semver, e.g. 22.0.0, 24.18.0)'
+        required: true
+        type: string
+
+# ── Prevent concurrent builds of the same version ──────────────────
+concurrency:
+  group: libnode-build-${{ github.event.inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+# ── Jobs ────────────────────────────────────────────────────────────
+jobs:
+
+  # ────────────────────────────────────────────────────────────────
+  #  1. Validate — extract version from tag, export build flags
+  # ────────────────────────────────────────────────────────────────
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    outputs:
+      major             : ${{ steps.parse.outputs.major }}
+      version           : ${{ steps.parse.outputs.version }}
+      windows_arch_list : ${{ steps.parse.outputs.windows_arch_list }}
+      use_clang_cl      : ${{ steps.parse.outputs.use_clang_cl }}
+      need_rust         : ${{ steps.parse.outputs.need_rust }}
+
+    steps:
+      - name: Parse and validate version
+        id: parse
+        run: |
+          # Determine version source: manual input or git tag
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+            SOURCE="manual workflow_dispatch"
+            echo "Source: ${SOURCE} (version=${VERSION})"
+          else
+            TAG_NAME="${{ github.ref_name }}"
+            SOURCE="tag push (${TAG_NAME})"
+            echo "Source: ${SOURCE}"
+            VERSION="${TAG_NAME#v}"
+          fi
+
+          echo "Extracted version: ${VERSION}"
+
+          # ── Format check: MAJOR.MINOR.PATCH ──────────────────
+          if ! echo "${VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Invalid version '${VERSION}'. Must be semver (e.g. 22.0.0)"
+            exit 1
+          fi
+
+          MAJOR="$(echo "${VERSION}" | cut -d. -f1)"
+
+          # ── Minimum version ──────────────────────────────────
+          if [ "${MAJOR}" -lt 22 ]; then
+            echo "::error::Minimum supported version is 22 (got ${MAJOR})"
+            exit 1
+          fi
+
+          # ── Even major only ──────────────────────────────────
+          if [ $((MAJOR % 2)) -ne 0 ]; then
+            echo "::error::Only even major versions are supported (got ${MAJOR})"
+            exit 1
+          fi
+
+          # ── Windows architecture list ────────────────────────
+          # v22: x64 + x86 ; v24+: x64 only
+          if [ "${MAJOR}" -eq 22 ]; then
+            WIN_ARCHES='["x64","x86"]'
+          else
+            WIN_ARCHES='["x64"]'
+          fi
+
+          # ── ClangCL required for Node.js >= 24 ───────────────
+          if [ "${MAJOR}" -ge 24 ]; then
+            USE_CLANG_CL='true'
+          else
+            USE_CLANG_CL='false'
+          fi
+
+          # ── Rust needed for Node.js >= 26 (Temporal/V8) ─────
+          if [ "${MAJOR}" -ge 26 ]; then
+            NEED_RUST='true'
+          else
+            NEED_RUST='false'
+          fi
+
+          # ── Export outputs ───────────────────────────────────
+          {
+            echo "major=${MAJOR}"
+            echo "version=${VERSION}"
+            echo "windows_arch_list=${WIN_ARCHES}"
+            echo "use_clang_cl=${USE_CLANG_CL}"
+            echo "need_rust=${NEED_RUST}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "--- Validation OK ---"
+          echo "  Source            : ${SOURCE}"
+          echo "  Version           : ${VERSION}"
+          echo "  Major             : ${MAJOR}"
+          echo "  Windows arches    : ${WIN_ARCHES}"
+          echo "  Use ClangCL       : ${USE_CLANG_CL}"
+          echo "  Need Rust         : ${NEED_RUST}"
+
+
+  # ────────────────────────────────────────────────────────────────
+  #  2. Build Linux x64 (native)
+  # ────────────────────────────────────────────────────────────────
+  build-linux-x64:
+    name: Linux x64
+    needs: validate
+    runs-on: ubuntu-24.04
+
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      MAJOR:   ${{ needs.validate.outputs.major }}
+      ARCH:    x64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build libnode
+        run: |
+          chmod +x scripts/build-linux.sh
+          ./scripts/build-linux.sh
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          MAJOR:   ${{ needs.validate.outputs.major }}
+          ARCH:    x64
+
+      - name: List archive
+        run: ls -la libnode-linux-x64.tar.gz
+
+      - name: Upload release asset (workflow artifact)
+        uses: actions/upload-artifact@v7
+        with:
+          name: libnode-linux-x64
+          path: libnode-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+
+  # ────────────────────────────────────────────────────────────────
+  #  3. Build Linux x86 (Docker container, v22 only)
+  # ────────────────────────────────────────────────────────────────
+  build-linux-x86:
+    name: Linux x86 (Docker)
+    needs: validate
+    if: needs.validate.outputs.major == '22'
+    runs-on: ubuntu-24.04
+
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      MAJOR:   ${{ needs.validate.outputs.major }}
+      ARCH:    x86
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build libnode in i386 Docker container
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            -e VERSION="${{ needs.validate.outputs.version }}" \
+            -e ARCH=x86 \
+            i386/debian:bullseye \
+            bash scripts/build-linux.sh
+
+      - name: List archive
+        run: ls -la libnode-linux-x86.tar.gz
+
+      - name: Upload release asset (workflow artifact)
+        uses: actions/upload-artifact@v7
+        with:
+          name: libnode-linux-x86
+          path: libnode-linux-x86.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+
+  # ────────────────────────────────────────────────────────────────
+  #  4. Build Windows (dynamic arch matrix)
+  # ────────────────────────────────────────────────────────────────
+  build-windows:
+    name: Windows ${{ matrix.arch }}
+    needs: validate
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        arch: ${{ fromJSON(needs.validate.outputs.windows_arch_list) }}
+      fail-fast: false
+
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      ARCH:    ${{ matrix.arch }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Build libnode
+        shell: pwsh
+        run: |
+          $useClangCL = "${{ needs.validate.outputs.use_clang_cl }}" -eq 'true'
+          $needRust   = "${{ needs.validate.outputs.need_rust }}" -eq 'true'
+          .\scripts\build-windows.ps1 -Version "${{ needs.validate.outputs.version }}" -Arch "${{ matrix.arch }}" -UseClangCL:$useClangCL -NeedRust:$needRust
+
+      - name: List archive
+        shell: pwsh
+        run: Get-ChildItem -Path libnode-windows-${{ matrix.arch }}.zip
+
+      - name: Upload release asset (workflow artifact)
+        uses: actions/upload-artifact@v7
+        with:
+          name: libnode-windows-${{ matrix.arch }}
+          path: libnode-windows-${{ matrix.arch }}.zip
+          if-no-files-found: error
+          retention-days: 1
+
+
+  # ────────────────────────────────────────────────────────────────
+  #  5. Release — create GitHub Release with all build archives
+  # ────────────────────────────────────────────────────────────────
+  release:
+    name: Create Release
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
+    needs: [validate, build-linux-x64, build-linux-x86, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all release assets
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Display release assets
+        run: |
+          echo "=== Release assets ==="
+          ls -la release-assets/
+
+      - name: Determine release tag
+        id: release-tag
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            # Manual trigger: create a new tag
+            echo "tag=v${{ needs.validate.outputs.version }}" >> "${GITHUB_OUTPUT}"
+          else
+            # Tag trigger: use the pushed tag
+            echo "tag=${{ github.ref_name }}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Display release assets
+        run: |
+          echo "=== Release assets ==="
+          ls -la release-assets/
+          for f in release-assets/*; do
+            echo "  $f ($(du -h "$f" | cut -f1))"
+          done
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release-tag.outputs.tag }}
+          name: libnode ${{ needs.validate.outputs.version }}
+          body: |
+            Node.js shared library build based on **Node.js v${{ needs.validate.outputs.version }}**.
+          files: release-assets/*
+          fail_on_unmatched_files: true
+          allowUpdates: true
+          draft: false
+          prerelease: false
