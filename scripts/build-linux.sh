@@ -79,9 +79,11 @@ if [ "${ARCH}" = "x86" ]; then
         sed -i "s/%endif/#endif/" "$f"
     done
 
-    # Enable SSE and native optimizations (no -m32; native 32-bit inside Docker)
-    export CXXFLAGS="-march=native -mfpmath=sse"
-    export CFLAGS="-march=native -mfpmath=sse"
+    # Baseline 32-bit x86 with SSE2 (no -m32; native 32-bit inside Docker). Never -march=native: it
+    # targets the CI runner's CPU (AVX/AVX2/AVX-512), and the library then dies with SIGILL on any
+    # machine without those instructions, e.g. Celeron/Atom servers.
+    export CXXFLAGS="-march=i686 -msse2 -mfpmath=sse"
+    export CFLAGS="-march=i686 -msse2 -mfpmath=sse"
 fi
 
 # ── Configure with --shared ─────────────────────────────────────────
